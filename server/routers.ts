@@ -1,9 +1,14 @@
 import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
-import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
+import { publicProcedure, protectedProcedure, router, adminProcedure } from "./_core/trpc";
 import { paymentRouter } from "./routers/paymentRouter";
 import { dataRouter } from "./routers/dataRouter";
+import { authRouter } from "./routers/authRouter";
+import { adminRouter } from "./routers/adminRouter";
+import { chatRouter } from "./routers/chatRouter";
+import { configRouter } from "./routers/configRouter";
+import { contactRouter } from "./routers/contactRouter";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import {
@@ -45,6 +50,7 @@ import {
   batchPushTask,
   calculatePilotScore,
 } from "./services/schedulingService";
+import { eq, and, desc } from "drizzle-orm";
 
 // Helper to ensure user has specific role
 function requireRole(allowedRoles: string[]) {
@@ -60,16 +66,16 @@ export const appRouter = router({
   system: systemRouter,
   payment: paymentRouter,
   data: dataRouter,
-
-  // ========== Auth Routes ==========
-  auth: router({
-    me: publicProcedure.query((opts) => opts.ctx.user),
-    logout: publicProcedure.mutation(({ ctx }) => {
-      const cookieOptions = getSessionCookieOptions(ctx.req);
-      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
-      return { success: true } as const;
-    }),
-  }),
+  // 认证路由 - 手机号登录、OAuth登录
+  auth: authRouter,
+  // 管理员路由 - 用户管理、资质审核、任务管理、统计分析
+  admin: adminRouter,
+  // 聊天路由 - 消息、敏感内容过滤
+  chat: chatRouter,
+  // 配置路由 - 定价、排序配置
+  config: configRouter,
+  // 联系解锁路由 - 付费获取飞手联系方式
+  contact: contactRouter,
 
   // ========== User Management Routes ==========
   user: router({
@@ -77,19 +83,15 @@ export const appRouter = router({
     profile: protectedProcedure.query(async ({ ctx }) => {
       const db = await getDb();
       if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-
       const userResult = await db
         .select()
         .from(users)
         .where(eq(users.id, ctx.user.id))
         .limit(1);
-
       if (userResult.length === 0) {
         throw new TRPCError({ code: "NOT_FOUND" });
       }
-
       const user = userResult[0];
-
       // Get role-specific profile
       let roleProfile = null;
       if (user.role === "customer") {
@@ -97,10 +99,8 @@ export const appRouter = router({
       } else if (user.role === "pilot") {
         roleProfile = await getPilotProfile(user.id);
       }
-
       return { user, roleProfile };
     }),
-
     // Update user profile
     updateProfile: protectedProcedure
       .input(
@@ -113,7 +113,6 @@ export const appRouter = router({
       .mutation(async ({ ctx, input }) => {
         const db = await getDb();
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-
         await db
           .update(users)
           .set({
@@ -123,7 +122,6 @@ export const appRouter = router({
             updatedAt: new Date(),
           })
           .where(eq(users.id, ctx.user.id));
-
         return { success: true };
       }),
   }),
@@ -134,7 +132,6 @@ export const appRouter = router({
     getProfile: requireRole(["customer"]).query(async ({ ctx }) => {
       return await getCustomerProfile(ctx.user.id);
     }),
-
     // Update customer profile
     updateProfile: requireRole(["customer"])
       .input(
@@ -148,12 +145,10 @@ export const appRouter = router({
       .mutation(async ({ ctx, input }) => {
         const db = await getDb();
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-
         const profile = await getCustomerProfile(ctx.user.id);
         if (!profile) {
           throw new TRPCError({ code: "NOT_FOUND" });
         }
-
         await db
           .update(customerProfiles)
           .set({
@@ -164,20 +159,16 @@ export const appRouter = router({
             updatedAt: new Date(),
           })
           .where(eq(customerProfiles.userId, ctx.user.id));
-
         return { success: true };
       }),
-
     // Get customer's tasks
     getTasks: requireRole(["customer"]).query(async ({ ctx }) => {
       return await getTasksByCustomer(ctx.user.id);
     }),
-
     // Get customer's orders
     getOrders: requireRole(["customer"]).query(async ({ ctx }) => {
       const db = await getDb();
       if (!db) return [];
-
       return await db
         .select()
         .from(orders)
@@ -192,7 +183,6 @@ export const appRouter = router({
     getProfile: requireRole(["pilot"]).query(async ({ ctx }) => {
       return await getPilotProfile(ctx.user.id);
     }),
-
     // Update pilot profile
     updateProfile: requireRole(["pilot"])
       .input(
@@ -208,12 +198,10 @@ export const appRouter = router({
       .mutation(async ({ ctx, input }) => {
         const db = await getDb();
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-
         const profile = await getPilotProfile(ctx.user.id);
         if (!profile) {
           throw new TRPCError({ code: "NOT_FOUND" });
         }
-
         await db
           .update(pilotProfiles)
           .set({
@@ -226,40 +214,32 @@ export const appRouter = router({
             updatedAt: new Date(),
           })
           .where(eq(pilotProfiles.userId, ctx.user.id));
-
         return { success: true };
       }),
-
     // Get available tasks for pilot
     getAvailableTasks: requireRole(["pilot"]).query(async ({ ctx }) => {
       const db = await getDb();
       if (!db) return [];
-
       const pilot = await getPilotProfile(ctx.user.id);
       if (!pilot) return [];
-
       // Get tasks that are in pushing state
       return await db
         .select()
         .from(tasks)
         .where(eq(tasks.status, "pushing"));
     }),
-
     // Get pilot's assigned tasks
     getAssignedTasks: requireRole(["pilot"]).query(async ({ ctx }) => {
       return await getTasksByPilot(ctx.user.id);
     }),
-
     // Accept a task
     acceptTask: requireRole(["pilot"])
       .input(z.object({ taskId: z.number() }))
       .mutation(async ({ ctx, input }) => {
         const db = await getDb();
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-
         const task = await getTask(input.taskId);
         if (!task) throw new TRPCError({ code: "NOT_FOUND" });
-
         // Check if task is still available
         if (task.status !== "pushing") {
           throw new TRPCError({
@@ -267,7 +247,6 @@ export const appRouter = router({
             message: "Task is no longer available",
           });
         }
-
         // Update task assignment
         await db
           .update(tasks)
@@ -278,7 +257,6 @@ export const appRouter = router({
             updatedAt: new Date(),
           })
           .where(eq(tasks.id, input.taskId));
-
         // Update push history
         await db
           .update(taskPushHistory)
@@ -293,17 +271,14 @@ export const appRouter = router({
               eq(taskPushHistory.pilotId, ctx.user.id)
             )
           );
-
         return { success: true };
       }),
-
     // Reject a task
     rejectTask: requireRole(["pilot"])
       .input(z.object({ taskId: z.number() }))
       .mutation(async ({ ctx, input }) => {
         const db = await getDb();
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-
         // Update push history
         await db
           .update(taskPushHistory)
@@ -318,10 +293,8 @@ export const appRouter = router({
               eq(taskPushHistory.pilotId, ctx.user.id)
             )
           );
-
         return { success: true };
       }),
-
     // Get pilot's ratings
     getRatings: requireRole(["pilot"]).query(async ({ ctx }) => {
       return await getPilotRatings(ctx.user.id);
@@ -336,7 +309,6 @@ export const appRouter = router({
       .query(async ({ input }) => {
         return await getTask(input.taskId);
       }),
-
     // Create new task (customer only)
     create: requireRole(["customer"])
       .input(
@@ -361,7 +333,6 @@ export const appRouter = router({
       .mutation(async ({ ctx, input }) => {
         const db = await getDb();
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-
         const result = await db.insert(tasks).values({
           customerId: ctx.user.id,
           taskType: input.taskType,
@@ -381,27 +352,22 @@ export const appRouter = router({
           budgetAmount: input.budgetAmount.toString(),
           status: "draft",
         });
-
         return { taskId: result[0].insertId };
       }),
-
     // Get tasks by status (admin)
     getByStatus: requireRole(["admin"])
       .input(z.object({ status: z.string() }))
       .query(async ({ input }) => {
         return await getTasksByStatus(input.status);
       }),
-
     // Approve task (admin)
     approve: requireRole(["admin"])
       .input(z.object({ taskId: z.number() }))
       .mutation(async ({ input }) => {
         const db = await getDb();
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-
         const task = await getTask(input.taskId);
         if (!task) throw new TRPCError({ code: "NOT_FOUND" });
-
         // Update task status
         await db
           .update(tasks)
@@ -410,20 +376,16 @@ export const appRouter = router({
             updatedAt: new Date(),
           })
           .where(eq(tasks.id, input.taskId));
-
         return { success: true };
       }),
-
     // Start task dispatch (admin)
     startDispatch: requireRole(["admin"])
       .input(z.object({ taskId: z.number() }))
       .mutation(async ({ input }) => {
         const db = await getDb();
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-
         const task = await getTask(input.taskId);
         if (!task) throw new TRPCError({ code: "NOT_FOUND" });
-
         // Get candidate pilots
         const candidates = await getCandidatePilots(task.taskType);
         if (candidates.length === 0) {
@@ -432,7 +394,6 @@ export const appRouter = router({
             message: "No available pilots for this task",
           });
         }
-
         // Rank pilots
         const rankedPilots = await rankPilots(
           candidates,
@@ -443,10 +404,8 @@ export const appRouter = router({
           task.area ? parseFloat(task.area.toString()) : null,
           task.weight ? parseFloat(task.weight.toString()) : null
         );
-
         // Batch push
         await batchPushTask(input.taskId, rankedPilots);
-
         // Update task status
         await db
           .update(tasks)
@@ -457,10 +416,8 @@ export const appRouter = router({
             updatedAt: new Date(),
           })
           .where(eq(tasks.id, input.taskId));
-
         return { success: true, pilotCount: rankedPilots.length };
       }),
-
     // Update task status
     updateStatus: protectedProcedure
       .input(
@@ -472,10 +429,8 @@ export const appRouter = router({
       .mutation(async ({ ctx, input }) => {
         const db = await getDb();
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-
         const task = await getTask(input.taskId);
         if (!task) throw new TRPCError({ code: "NOT_FOUND" });
-
         // Verify permission
         if (
           ctx.user.role !== "admin" &&
@@ -484,7 +439,6 @@ export const appRouter = router({
         ) {
           throw new TRPCError({ code: "FORBIDDEN" });
         }
-
         await db
           .update(tasks)
           .set({
@@ -492,7 +446,6 @@ export const appRouter = router({
             updatedAt: new Date(),
           })
           .where(eq(tasks.id, input.taskId));
-
         return { success: true };
       }),
   }),
@@ -505,14 +458,12 @@ export const appRouter = router({
       .query(async ({ ctx, input }) => {
         return await getUserNotifications(ctx.user.id, input.limit);
       }),
-
     // Mark notification as read
     markAsRead: protectedProcedure
       .input(z.object({ notificationId: z.number() }))
       .mutation(async ({ input }) => {
         const db = await getDb();
         if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR" });
-
         await db
           .update(notifications)
           .set({
@@ -520,13 +471,9 @@ export const appRouter = router({
             readAt: new Date(),
           })
           .where(eq(notifications.id, input.notificationId));
-
         return { success: true };
       }),
   }),
 });
 
 export type AppRouter = typeof appRouter;
-
-// Import eq and desc at the top
-import { eq, and, desc } from "drizzle-orm";
